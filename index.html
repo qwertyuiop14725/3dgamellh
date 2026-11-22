@@ -228,7 +228,7 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
   </header>
 
   <div class="head">
-    <div class="kicker">System Check · 运行环境</div>
+    <div class="kicker">Strict Check · 严格检测</div>
     <h1>环境检测</h1>
     <p class="lede"><span>在雪落下来之前，先确认这台设备能把它画出来。</span><span>检测只在本机进行，不会上传任何信息。</span></p>
   </div>
@@ -239,7 +239,7 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
 
   <div class="meter" aria-hidden="true">
     <i id="meter-fill"></i>
-    <span class="count" id="meter-count">00 / 08</span>
+    <span class="count" id="meter-count">00 / 10</span>
   </div>
 
   <ol class="list" id="list"></ol>
@@ -266,7 +266,7 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
 
   <footer>
     雪迹 · 一个人，一座山，一直往下<br>
-    检测器 v1.0<span class="sep">/</span>本地运行<span class="sep">/</span>不上传数据
+    检测器 v1.2<span class="sep">/</span>WebView 95 基线<span class="sep">/</span>桌面兼容<span class="sep">/</span>不上传数据
   </footer>
 </main>
 
@@ -280,6 +280,15 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
   /* 如果游戏文件名不同，只改这一行 */
   var GAME_FILE = '游戏.html';
 
+  /* ---- 严格基线：内核不得低于 Android System WebView 95 / Chromium 95 ----
+     WebView 95（2021-10）与 Chrome 95、Edge 95、WebView2 95 同代；
+     Firefox 94、Safari / iOS WebKit 15 为同期等价内核。 */
+  var MIN_WEBVIEW = 95;      // Blink / Chromium / WebView 硬基线
+  var MIN_GECKO   = 94;      // Firefox 同期等价
+  var MIN_WEBKIT  = 15;      // Safari / iOS WebKit 同期等价
+  var RECOMMEND   = 110;     // 建议版本（Chromium 系）
+  var RECOMMEND_WEBKIT = 16; // 建议版本（WebKit 系）
+
   var LABEL = { wait: '等待', run: '检测中', pass: '通过', warn: '注意', fail: '未通过' };
   var ICON = {
     wait: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.1" fill="currentColor"/></svg>',
@@ -291,7 +300,9 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
   };
 
   var ROWS = [
-    { id: 'page',    cn: '页面环境', en: 'PAGE',        hint: '浏览器 · 动画帧 · 现代接口' },
+    { id: 'page',    cn: '页面环境', en: 'PAGE',        hint: '平台 · 安全上下文 · 现代接口' },
+    { id: 'entry',   cn: '游戏入口', en: 'GAME FILE',    hint: '入口文件 · 可读性 · 内容校验' },
+    { id: 'kernel',  cn: '浏览器内核', en: 'ENGINE',      hint: '内核识别 · WebView 95 基线' },
     { id: 'gpu',     cn: '图形接口', en: 'GRAPHICS',    hint: 'WebGPU / WebGL2' },
     { id: 'render',  cn: '渲染自检', en: 'RENDER',      hint: '着色器 · 离屏绘制 · HDR' },
     { id: 'audio',   cn: '声音',     en: 'AUDIO',       hint: 'Web Audio · 离线渲染' },
@@ -302,7 +313,7 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
   ];
 
   var state = { done: 0, results: [], finished: false, mode: 'scan', leaving: false, timer: null };
-  var env = { ua: null, webgl: null, render: null, gpu: null, gpuPromise: null, perf: null };
+  var env = { ua: null, kernel: null, webgl: null, render: null, gpu: null, gpuPromise: null, perf: null, chList: null };
   var rowEls = {};
 
   function $(id) { return document.getElementById(id); }
@@ -386,9 +397,404 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
 
     if (m) ver = m[1];
 
-    var warnShell = { '微信': 1, 'QQ': 1, '微博': 1, '钉钉': 1, '支付宝': 1, '抖音': 1, 'UC': 1, '夸克': 1, '百度': 1 };
+    return { engine: engine, ver: ver, container: container, ua: ua };
+  }
 
-    return { engine: engine, ver: ver, container: container, warn: !!(container && warnShell[container]), ua: ua };
+  /* ---------------- browser kernel ---------------- */
+
+  function fmtVer(v) {
+    if (!v) return '';
+    return String(Math.round(v * 100) / 100).replace(/\.0+$/, '');
+  }
+
+  function supportsFlexGap() {
+    try {
+      var host = document.createElement('div');
+      host.style.cssText = 'position:absolute;left:-9999px;top:0;display:flex;flex-direction:column;row-gap:10px;';
+      var a = document.createElement('div');
+      var b = document.createElement('div');
+      a.style.cssText = 'height:10px;width:2px';
+      b.style.cssText = 'height:10px;width:2px';
+      host.appendChild(a);
+      host.appendChild(b);
+      document.body.appendChild(host);
+      var ok = (b.getBoundingClientRect().top - a.getBoundingClientRect().top) >= 19;
+      document.body.removeChild(host);
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function kernelBaseline() {
+    var out = {
+      es2020: false, asyncOk: false,
+      missingApi: [], apiOk: 0, apiTotal: 0,
+      missingCss: [], cssOk: 0, cssTotal: 0,
+      missingEnhanced: [], enhancedOk: 0, enhancedTotal: 0
+    };
+
+    /* 游戏源码使用 ??、async/await、for...of、解构；解析失败即无法启动 */
+    try {
+      out.es2020 = new Function('var a = { b: 1 }; return (a?.b ?? 0) === 1 && (undefined ?? 2) === 2;')() === true;
+    } catch (e) { out.es2020 = false; }
+    try {
+      out.asyncOk = new Function('return (async function () { var s = 0; for (var x of [1, 2]) s += x; return s; })() instanceof Promise;')() === true;
+    } catch (e) { out.asyncOk = false; }
+
+    /* 游戏 boot 链路真实依赖：缺一项都会中途抛错或形态判定失效 */
+    var apis = [
+      ['Promise', typeof Promise !== 'undefined'],
+      ['URLSearchParams', 'URLSearchParams' in window],
+      ['requestAnimationFrame', typeof requestAnimationFrame === 'function'],
+      ['TypedArray', typeof Float32Array !== 'undefined' && typeof Uint32Array !== 'undefined'],
+      ['matchMedia', !!window.matchMedia],
+      ['Web Storage 接口', (function () { try { return !!window.localStorage; } catch (e) { return false; } })()]
+    ];
+    for (var a = 0; a < apis.length; a++) {
+      if (apis[a][1]) out.apiOk++;
+      else out.missingApi.push(apis[a][0]);
+    }
+    out.apiTotal = apis.length;
+
+    /* 阻断级 CSS：WebView 95 / 同期内核都应具备；缺 2 项以上视为版本虚标 */
+    var tests = [
+      ['inset', '0', 'inset'],
+      ['overscroll-behavior', 'contain', 'overscroll-behavior'],
+      ['font-size', 'clamp(10px, 2vw, 20px)', 'clamp()'],
+      ['display', 'grid', 'CSS Grid'],
+      ['aspect-ratio', '1', 'aspect-ratio'],
+      ['width', 'calc(10px + 1vmin)', 'calc()/vmin']
+    ];
+    for (var i = 0; i < tests.length; i++) {
+      var prop = tests[i][0], val = tests[i][1], label = tests[i][2], ok = false;
+      try {
+        if (window.CSS && CSS.supports) ok = !!CSS.supports(prop, val);
+      } catch (e) {}
+      if (ok) out.cssOk++;
+      else out.missingCss.push(label);
+    }
+    if (supportsFlexGap()) out.cssOk++;
+    else out.missingCss.push('flex gap');
+    out.cssTotal = tests.length + 1;
+
+    /* 增强级：新内核才有，缺失只影响观感，不阻止进入 */
+    var enhanced = [
+      ['backdrop-filter', 'blur(2px)', 'backdrop-filter'],
+      ['width', 'env(safe-area-inset-top, 0px)', 'env()'],
+      ['text-wrap', 'balance', 'text-wrap'],
+      ['height', '100dvh', 'dvh'],
+      ['color', 'color-mix(in srgb, red, blue)', 'color-mix()']
+    ];
+    for (var j = 0; j < enhanced.length; j++) {
+      var ep = enhanced[j][0], ev = enhanced[j][1], el = enhanced[j][2], eok = false;
+      try {
+        if (window.CSS && CSS.supports) {
+          eok = !!CSS.supports(ep, ev);
+          if (!eok && ep === 'backdrop-filter') eok = !!CSS.supports('-webkit-backdrop-filter', ev);
+        }
+      } catch (e2) {}
+      if (eok) out.enhancedOk++;
+      else out.missingEnhanced.push(el);
+    }
+    out.enhancedTotal = enhanced.length;
+    return out;
+  }
+
+  /* 设备形态：桌面 / 手持 / 平板，与游戏 handheld() 的判定口径一致 */
+  function isDesktop() {
+    var ua = navigator.userAgent || '';
+    if (/iPhone|iPod|Android|Windows Phone|Mobile/i.test(ua)) return false;
+    if (/iPad/.test(ua)) return false;
+    if (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1) return false; // iPadOS 桌面模式
+    return true;
+  }
+
+  /* WebView 家族：Android System WebView / X5(TBS) / WebView2 / Electron */
+  function webviewKind(ua) {
+    var kind = '';
+    if (/;\s*wv\)/.test(ua) || /Version\/4\.0\s+Chrome\//.test(ua)) kind = 'Android WebView';
+    if (/\bTBS\/\d|\bXWEB\/\d|MQQBrowser\//i.test(ua)) kind += (kind ? ' · ' : '') + 'X5/TBS';
+    if (/WebView2/i.test(ua)) kind += (kind ? ' · ' : '') + 'WebView2';
+    if (/Electron\//i.test(ua)) kind += (kind ? ' · ' : '') + 'Electron';
+    return kind;
+  }
+
+  function kernelInfo() {
+    var ua = navigator.userAgent || '';
+    var vendor = navigator.vendor || '';
+    var doc = document;
+    var w = window;
+    var m;
+
+    var isiOS = /iPhone|iPad|iPod/.test(ua) ||
+      (navigator.platform === 'MacIntel' && (navigator.maxTouchPoints || 0) > 1);
+
+    /* 引擎指纹：不看 UA 声称，先看真实能力特征 */
+    var fpTrident = ('documentMode' in doc);
+    var fpPresto = !!(w.opera && w.opera.version) && !/OPR\//.test(ua);
+    var fpEdgeHtml = /Edge\/(\d+)/.test(ua) && !/Edg\//.test(ua);
+    var fpGecko = ('mozInnerScreenX' in w) ||
+      !!(w.CSS && w.CSS.supports && w.CSS.supports('-moz-appearance', 'none'));
+    var fpWebkit = !fpGecko && !fpTrident && !fpPresto && (/Apple/.test(vendor) || isiOS);
+    var fpBlink = !fpGecko && !fpWebkit && !fpTrident && !fpPresto &&
+      (!!w.chrome || /Google Inc/.test(vendor));
+
+    var engine = 'unknown', engineName = '未知内核', version = 0;
+    if (fpTrident) {
+      engine = 'trident'; engineName = 'Trident';
+      m = /MSIE (\d+)/.exec(ua) || /rv:(\d+)/.exec(ua);
+      version = m ? parseFloat(m[1]) : 0;
+    } else if (fpPresto) {
+      engine = 'presto'; engineName = 'Presto';
+      m = /Version\/(\d+(?:\.\d+)?)/.exec(ua) || /Opera[\/ ](\d+(?:\.\d+)?)/.exec(ua);
+      version = m ? parseFloat(m[1]) : 0;
+    } else if (fpEdgeHtml) {
+      engine = 'edgehtml'; engineName = 'EdgeHTML';
+      m = /Edge\/(\d+)/.exec(ua);
+      version = m ? parseFloat(m[1]) : 0;
+    } else if (fpGecko) {
+      engine = 'gecko'; engineName = 'Gecko';
+      m = /(?:Firefox|FxiOS)\/(\d+)/.exec(ua);
+      version = m ? parseFloat(m[1]) : 0;
+    } else if (fpWebkit) {
+      engine = 'webkit'; engineName = 'WebKit';
+      m = /Version\/(\d+(?:\.\d+)?)/.exec(ua);
+      version = m ? parseFloat(m[1]) : 0;
+      if (!version && isiOS) {
+        m = /OS (\d+)[._](\d+)/.exec(ua);
+        if (m) version = parseFloat(m[1] + '.' + m[2]);
+      }
+    } else if (fpBlink) {
+      engine = 'blink'; engineName = 'Blink';
+      m = /(?:Chrome|Chromium|CriOS)\/(\d+)/.exec(ua);
+      version = m ? parseFloat(m[1]) : 0;
+    }
+
+    /* 没有任何指纹时，才退回 UA 声称的引擎 */
+    if (engine === 'unknown') {
+      if (/Trident\/|MSIE /.test(ua)) {
+        engine = 'trident'; engineName = 'Trident';
+        m = /MSIE (\d+)/.exec(ua) || /rv:(\d+)/.exec(ua);
+      } else if (/Firefox\//.test(ua)) {
+        engine = 'gecko'; engineName = 'Gecko';
+        m = /Firefox\/(\d+)/.exec(ua);
+      } else if (/Chrome\/|Chromium\//.test(ua)) {
+        engine = 'blink'; engineName = 'Blink';
+        m = /(?:Chrome|Chromium)\/(\d+)/.exec(ua);
+      } else if (/Version\/[\d.]+.*Safari/.test(ua)) {
+        engine = 'webkit'; engineName = 'WebKit';
+        m = /Version\/(\d+(?:\.\d+)?)/.exec(ua);
+      } else {
+        m = null;
+      }
+      if (m) version = parseFloat(m[1]) || 0;
+    }
+
+    /* UA-CH：Chromium 系真实内核版本，可识破冻结 UA 与虚标版本 */
+    var chBrands = [];
+    try {
+      chBrands = (navigator.userAgentData && navigator.userAgentData.brands) || [];
+    } catch (e) {}
+    var chVersion = 0, chBrand = '';
+    for (var i = 0; i < chBrands.length; i++) {
+      var cb = chBrands[i] || {};
+      var cbv = parseInt(cb.version, 10) || 0;
+      if (/Chromium/i.test(cb.brand) && cbv > chVersion) chVersion = cbv;
+      if (!chBrand && /Google Chrome|Microsoft Edge|Opera|Brave/i.test(cb.brand)) chBrand = cb.brand;
+    }
+    /* fullVersionList 比 brands 更精确，能覆盖被裁剪或冻结的 UA */
+    var chList = env.chList || [];
+    for (var cl = 0; cl < chList.length; cl++) {
+      var fl = chList[cl] || {};
+      var flv = parseInt(fl.version, 10) || 0;
+      if (/Chromium/i.test(fl.brand) && flv > chVersion) chVersion = flv;
+      if (!chBrand && /Google Chrome|Microsoft Edge|Opera|Brave/i.test(fl.brand)) chBrand = fl.brand;
+    }
+
+    var uaMajor = 0;
+    var uaM = /(?:Chrome|Chromium|CriOS)\/(\d+)/.exec(ua);
+    if (uaM) uaMajor = parseInt(uaM[1], 10) || 0;
+
+    /* 关键：Chromium 系一律以 UA-CH 真实版本为准，UA 只作兜底。
+       套壳浏览器常把 Chrome/ 写成很高版本，取较大值会放过老内核。 */
+    if (engine === 'blink' || (engine === 'unknown' && uaMajor)) {
+      if (engine === 'unknown') { engine = 'blink'; engineName = 'Blink'; }
+      version = chVersion || uaMajor || version || 0;
+    }
+
+    /* 应用内置容器 */
+    var container = '';
+    if (/MicroMessenger/i.test(ua)) container = '微信';
+    else if (/QQ\//i.test(ua)) container = 'QQ';
+    else if (/Weibo/i.test(ua)) container = '微博';
+    else if (/DingTalk/i.test(ua)) container = '钉钉';
+    else if (/AlipayClient/i.test(ua)) container = '支付宝';
+    else if (/aweme|BytedanceWebview/i.test(ua)) container = '抖音';
+    else if (/XHS|xiaohongshu|discover\/\d/i.test(ua)) container = '小红书';
+
+    var webview = webviewKind(ua);
+    var desktop = isDesktop();
+
+    /* 品牌 / 外壳 */
+    var brand = '', brandVersion = '';
+    if (container) {
+      brand = container + '内置';
+    } else if (isiOS) {
+      if (/CriOS\//.test(ua)) brand = 'Chrome iOS';
+      else if (/FxiOS\//.test(ua)) brand = 'Firefox iOS';
+      else if (/EdgiOS\//.test(ua)) brand = 'Edge iOS';
+      else if (/OPiOS\//.test(ua)) brand = 'Opera iOS';
+      else if (/Version\/[\d.]+.*Safari/.test(ua)) brand = 'Safari';
+      else brand = 'iOS 浏览器';
+    } else if (/Edge\//.test(ua)) {
+      brand = 'Edge'; m = /Edge\/(\d+)/.exec(ua); brandVersion = m ? m[1] : '';
+    } else if (/Opera[\/ ]/.test(ua)) {
+      brand = 'Opera';
+    } else if (/Edg\//.test(ua)) {
+      brand = 'Edge'; m = /Edg\/(\d+)/.exec(ua); brandVersion = m ? m[1] : '';
+    } else if (/OPR\//.test(ua)) {
+      brand = 'Opera'; m = /OPR\/(\d+)/.exec(ua); brandVersion = m ? m[1] : '';
+    } else if (/SamsungBrowser\//.test(ua)) {
+      brand = 'Samsung Internet'; m = /SamsungBrowser\/(\d+)/.exec(ua); brandVersion = m ? m[1] : '';
+    } else if (/M?QQBrowser\//.test(ua)) {
+      brand = 'QQ 浏览器'; m = /M?QQBrowser\/(\d+)/.exec(ua); brandVersion = m ? m[1] : '';
+    } else if (/(?:360SE|360EE|QIHU 360SE|360Browser)/i.test(ua)) {
+      brand = '360 浏览器';
+    } else if (/UCBrowser|UBrowser/i.test(ua)) {
+      brand = 'UC 浏览器'; m = /(?:UCBrowser|UBrowser)\/(\d+)/.exec(ua); brandVersion = m ? m[1] : '';
+    } else if (/Quark/i.test(ua)) {
+      brand = '夸克';
+    } else if (/BIDUBrowser|baidubrowser|baiduboxapp/i.test(ua)) {
+      brand = '百度浏览器';
+    } else if (/MetaSr|SogouMobileBrowser/i.test(ua)) {
+      brand = '搜狗浏览器';
+    } else if (/Maxthon/i.test(ua)) {
+      brand = '傲游';
+    } else if (/LBBROWSER/i.test(ua)) {
+      brand = '猎豹浏览器';
+    } else if (/2345Explorer|2345chrome/i.test(ua)) {
+      brand = '2345 浏览器';
+    } else if (/HuaweiBrowser/i.test(ua)) {
+      brand = '华为浏览器';
+    } else if (/MiuiBrowser/i.test(ua)) {
+      brand = '小米浏览器';
+    } else if (/VivoBrowser/i.test(ua)) {
+      brand = 'vivo 浏览器';
+    } else if (/HeyTapBrowser/i.test(ua)) {
+      brand = 'OPPO 浏览器';
+    } else if (/Chromium\//.test(ua)) {
+      brand = 'Chromium';
+    } else if (/Chrome\//.test(ua)) {
+      brand = 'Chrome';
+    } else if (/Firefox\//.test(ua)) {
+      brand = 'Firefox';
+    } else if (/Version\/[\d.]+.*Safari/.test(ua)) {
+      brand = 'Safari';
+    }
+    if (!brand) brand = (engine === 'blink' && chBrand) ? chBrand : (engine === 'blink' ? 'Chromium' : engineName);
+    if (!brandVersion && engine === 'blink' && chVersion) brandVersion = String(chVersion);
+    if (!brandVersion) {
+      m = /(?:Chrome|Chromium)\/(\d+)/.exec(ua);
+      if (m) brandVersion = m[1];
+    }
+    if ((engine === 'webkit') && !brandVersion && version) brandVersion = fmtVer(version);
+
+    var shells = {
+      'QQ 浏览器': 1, '360 浏览器': 1, 'UC 浏览器': 1, '夸克': 1, '百度浏览器': 1,
+      '搜狗浏览器': 1, '傲游': 1, '猎豹浏览器': 1, '2345 浏览器': 1
+    };
+    var shell = !!shells[brand];
+
+    /* UA 声称的引擎；iOS 上所有浏览器都是 WebKit，不做对比 */
+    var claim = '';
+    if (!isiOS) {
+      if (/Trident\/|MSIE /.test(ua)) claim = 'trident';
+      else if (/Firefox\//.test(ua)) claim = 'gecko';
+      else if (/Chrome\/|Chromium\//.test(ua)) claim = 'blink';
+      else if (/Version\/[\d.]+.*Safari/.test(ua)) claim = 'webkit';
+    }
+    var mismatch = !!(claim && engine !== 'unknown' && claim !== engine);
+
+    var baseline = kernelBaseline();
+
+    return {
+      engine: engine, engineName: engineName, version: version,
+      brand: brand, brandVersion: brandVersion,
+      container: container, shell: shell, webview: webview, desktop: desktop,
+      claim: claim, mismatch: mismatch,
+      chBrands: chBrands, chVersion: chVersion, uaMajor: uaMajor,
+      baseline: baseline, ua: ua
+    };
+  }
+
+  function checkKernel() {
+    var k = env.kernel || kernelInfo();
+    env.kernel = k;
+
+    var level = 'pass', verdict = '达到 WebView ' + MIN_WEBVIEW + ' 基线';
+    var v = k.version || 0;
+    var major = Math.floor(v);
+
+    if (k.engine === 'trident') {
+      level = 'fail'; verdict = 'Trident 内核，无法运行 WebGL2';
+    } else if (k.engine === 'presto') {
+      level = 'fail'; verdict = 'Presto 内核已停止更新，无法运行';
+    } else if (k.engine === 'edgehtml') {
+      level = 'fail'; verdict = 'EdgeHTML 已停止更新，请改用新版 Edge';
+    } else if (k.engine === 'blink') {
+      if (!major) {
+        level = 'fail'; verdict = '内核版本无法确认，按低于 WebView ' + MIN_WEBVIEW + ' 处理';
+      } else if (major < MIN_WEBVIEW) {
+        level = 'fail'; verdict = '内核 ' + major + ' 低于 WebView ' + MIN_WEBVIEW + ' 基线，游戏无法启动';
+      } else if (major < RECOMMEND) {
+        level = 'warn'; verdict = '达到 ' + MIN_WEBVIEW + ' 基线，低于建议版本 ' + RECOMMEND;
+      }
+    } else if (k.engine === 'gecko') {
+      if (!major) { level = 'fail'; verdict = 'Firefox 版本无法确认，按低于 ' + MIN_GECKO + ' 处理'; }
+      else if (major < MIN_GECKO) { level = 'fail'; verdict = 'Firefox ' + major + ' 低于同期基线 ' + MIN_GECKO + '（等价 WebView ' + MIN_WEBVIEW + '）'; }
+      else if (major < RECOMMEND) { level = 'warn'; verdict = '达到同期基线，低于建议版本 ' + RECOMMEND; }
+    } else if (k.engine === 'webkit') {
+      if (!v) { level = 'fail'; verdict = 'Safari / WebKit 版本无法确认，按低于 ' + MIN_WEBKIT + ' 处理'; }
+      else if (v < MIN_WEBKIT) { level = 'fail'; verdict = 'Safari / WebKit ' + fmtVer(v) + ' 低于同期基线 ' + MIN_WEBKIT; }
+      else if (v < RECOMMEND_WEBKIT) { level = 'warn'; verdict = '达到同期基线，低于建议版本 ' + RECOMMEND_WEBKIT; }
+    } else {
+      level = 'fail'; verdict = '内核无法识别，无法确认达到 WebView ' + MIN_WEBVIEW + ' 基线';
+    }
+
+    /* 能力交叉验证：UA 版本达标但能力缺失，按裁剪内核 / 版本虚标处理 */
+    var b = k.baseline;
+    var cap = '';
+    if (b.missingApi.length) cap = '缺少启动接口：' + b.missingApi.join('、');
+    else if (!b.es2020 || !b.asyncOk) cap = '不支持游戏语法（?? / async）';
+    else if (b.missingCss.length >= 2) cap = '能力与所报版本不符（疑似版本虚标）：缺 ' + b.missingCss.join('、');
+    else if (b.missingCss.length === 1) cap = '部分样式缺失：' + b.missingCss[0];
+
+    if (cap) {
+      if (level === 'fail') verdict += ' · ' + cap;
+      else if (/疑似版本虚标|缺少启动接口|不支持游戏语法/.test(cap)) { level = 'fail'; verdict = cap; }
+      else { level = 'warn'; verdict = cap + '（建议升级）'; }
+    }
+
+    if (k.mismatch && level !== 'fail') {
+      level = 'warn'; verdict = 'UA 与内核指纹不一致';
+    }
+    if (k.container) {
+      if (level !== 'fail') { level = 'warn'; verdict = '应用内置浏览器（' + k.container + '），建议改用系统浏览器'; }
+      else verdict += ' · 建议改用系统浏览器';
+    } else if (k.shell) {
+      if (level !== 'fail') { level = 'warn'; verdict = '套壳浏览器，建议改用系统浏览器'; }
+      else verdict += ' · 建议改用系统浏览器';
+    }
+
+    var bits = [k.engineName + (v ? ' ' + fmtVer(v) : '')];
+    if (k.brand && k.brand !== k.engineName) bits.push(k.brand + (k.brandVersion ? ' ' + k.brandVersion : ''));
+    if (k.webview) bits.push(k.webview);
+    if (k.desktop) bits.push('桌面端');
+    if (k.chVersion) bits.push('UA-CH 实核 ' + k.chVersion);
+    bits.push(verdict);
+
+    return { level: level, detail: bits.join(' · ') };
   }
 
   function platformLabel() {
@@ -724,25 +1130,85 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
   /* ---------------- checks ---------------- */
 
   function checkPage() {
-    var info = env.ua || uaInfo();
     var missing = [];
     if (typeof Promise === 'undefined') missing.push('Promise');
     if (typeof requestAnimationFrame !== 'function') missing.push('动画帧');
     if (!('URLSearchParams' in window)) missing.push('URLSearchParams');
     if (!document.createElement || !document.createElement('canvas').getContext) missing.push('Canvas');
+    if (typeof Float32Array === 'undefined' || typeof Uint32Array === 'undefined') missing.push('TypedArray');
+    if (!window.matchMedia) missing.push('matchMedia');
+    try { if (!window.localStorage) missing.push('Web Storage'); }
+    catch (e) { missing.push('Web Storage'); }
 
     if (missing.length) {
-      return { level: 'fail', detail: '缺少 ' + missing.join('、') + '，请升级浏览器' };
+      return { level: 'fail', detail: '缺少 ' + missing.join('、') + '，游戏无法启动，请升级浏览器' };
     }
 
-    var bits = [];
-    bits.push(info.engine + (info.ver ? ' ' + info.ver : ''));
-    if (info.container) bits.push(info.container + '内置');
-    bits.push(platformLabel());
+    var proto = window.location.protocol;
+    var bits = [platformLabel(), isDesktop() ? '桌面端' : '移动 / 手持'];
+    bits.push(proto === 'file:' ? '本地文件'
+      : (window.isSecureContext ? '安全上下文' : '非安全上下文（WebGPU 不可用，走 WebGL2）'));
+    bits.push('现代接口就绪');
+    return { level: 'pass', detail: bits.join(' · ') };
+  }
 
-    var detail = bits.join(' · ');
-    if (info.warn) return { level: 'warn', detail: detail + ' · 如遇异常请改用系统浏览器' };
-    return { level: 'pass', detail: detail };
+  /* 游戏入口：在放行前真正读一次 游戏.html，确认不是 404 / 空文件 / 错版本 */
+  function checkGameFile(done) {
+    var url;
+    try { url = new URL(GAME_FILE, window.location.href).href; }
+    catch (e) { url = GAME_FILE; }
+    var isFile = window.location.protocol === 'file:';
+    var settled = false, timer = null;
+
+    function finish(res) {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      done(res);
+    }
+    timer = setTimeout(function () {
+      finish({ level: 'warn', detail: '入口预读超时，未能确认游戏文件（可直接打开验证）' });
+    }, 4500);
+
+    var xhr;
+    try { xhr = new XMLHttpRequest(); }
+    catch (eXHR) { finish({ level: 'warn', detail: '浏览器不支持预读，打开时验证入口' }); return; }
+
+    function unreadable() {
+      return isFile
+        ? { level: 'warn', detail: '本地文件模式无法预读（浏览器安全限制），打开即验证' }
+        : { level: 'fail', detail: '读取 ' + GAME_FILE + ' 失败（HTTP ' + xhr.status + '），请确认文件与本页同目录' };
+    }
+
+    try {
+      xhr.open('GET', url, true);
+      try { xhr.setRequestHeader('Range', 'bytes=0-4095'); } catch (eRange) {}
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        var text = xhr.responseText || '';
+        var status = xhr.status;
+        if (status !== 200 && status !== 206 && !(isFile && status === 0 && text.length)) {
+          finish(unreadable());
+          return;
+        }
+        if (!/雪迹|Cold Smoke/i.test(text) || !/<html|<meta|<script|<style|<!doctype/i.test(text)) {
+          finish({ level: 'fail', detail: '入口内容不是《雪迹》游戏页面，请检查 ' + GAME_FILE });
+          return;
+        }
+        var full = text.length > 20000;
+        if (full && !/getContext\(['"]webgl2|navigator\.gpu|id=["']view["']/.test(text)) {
+          finish({ level: 'fail', detail: '入口缺少 WebGL2 / WebGPU 启动标记，可能不是正确版本' });
+          return;
+        }
+        var kb = Math.round(text.length / 1024);
+        var size = kb > 1024 ? (kb / 1024).toFixed(1) + ' MB' : kb + ' KB';
+        finish({ level: 'pass', detail: '游戏入口可读 · ' + size + (full ? ' · 启动标记齐全' : ' · 片段校验通过') });
+      };
+      xhr.onerror = function () { finish(unreadable()); };
+      xhr.send();
+    } catch (e) {
+      finish({ level: 'warn', detail: '入口预读被拦截，打开时验证：' + msgOf(e) });
+    }
   }
 
   function checkGPU(done) {
@@ -834,18 +1300,28 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
     var fine = !!(window.matchMedia && window.matchMedia('(pointer: fine)').matches);
     var touch = (navigator.maxTouchPoints || 0) > 0 || coarse || 'ontouchstart' in window;
     var keys = 'onkeydown' in window;
+    var desktop = isDesktop();
 
     if (!pointer) {
-      return { level: 'fail', detail: '缺少 Pointer Events，游戏无法接收拖动操作' };
+      return { level: 'fail', detail: '缺少 Pointer Events，游戏无法接收拖动 / 转向操作' };
+    }
+    if (desktop && !keys) {
+      return { level: 'fail', detail: '桌面端缺少键盘事件，无法操作游戏' };
     }
 
     var parts = ['指针事件'];
-    if (touch) parts.push('触屏');
-    if (fine) parts.push('鼠标');
-    if (keys && (fine || !touch)) parts.push('键盘');
-    var d = parts.join(' · ');
-    if (touch) d += ' · 可拖动转向';
-    return { level: 'pass', detail: d };
+    if (desktop) {
+      parts.push('鼠标');
+      parts.push('键盘');
+      if (touch) parts.push('触屏');
+      parts.push('桌面模式（方向键 / 鼠标转向）');
+    } else {
+      if (touch) parts.push('触屏');
+      if (fine) parts.push('鼠标');
+      if (keys && (fine || !touch)) parts.push('键盘');
+      parts.push(touch ? '可拖动转向' : '可按键转向');
+    }
+    return { level: 'pass', detail: parts.join(' · ') };
   }
 
   function isSoftwareGL() {
@@ -911,9 +1387,13 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
     var w = Math.round(window.innerWidth), h = Math.round(window.innerHeight);
     var dpr = Math.round((window.devicePixelRatio || 1) * 100) / 100;
     var small = Math.min(w, h) < 300;
+    var desktop = isDesktop();
+    var bits = [w + ' × ' + h, 'DPR ' + dpr, desktop ? '桌面窗口' : (h >= w ? '竖屏' : '横屏')];
+    bits.push(desktop ? '桌面布局' : (h >= w ? '自动旋转适配' : '横屏运行'));
+    if (small) bits.push('视口偏小');
     return {
       level: small ? 'warn' : 'pass',
-      detail: w + ' × ' + h + ' · DPR ' + dpr + ' · ' + (h >= w ? '竖屏' : '横屏') + (small ? ' · 视口偏小' : '')
+      detail: bits.join(' · ')
     };
   }
 
@@ -921,6 +1401,8 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
 
   var STEPS = [
     { id: 'page', run: function (done) { done(checkPage()); } },
+    { id: 'entry', run: checkGameFile },
+    { id: 'kernel', run: function (done) { done(checkKernel()); } },
     { id: 'gpu', run: checkGPU },
     { id: 'render', run: function (done) { done(checkRender()); } },
     { id: 'audio', run: function (done) { done(checkAudio()); } },
@@ -1059,11 +1541,19 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
     box.hidden = false;
     box.className = 'result fail';
     $('r-icon').innerHTML = ICON.fail;
-    $('r-title').textContent = '检测未通过';
 
-    var names = [];
-    for (var i = 0; i < fails.length; i++) names.push(fails[i].cn);
-    $('r-sub').textContent = '缺少运行游戏所需的关键能力：' + names.join('、') + '。画面可能黑屏、卡顿或无法操作——你可以退出，也可以坚持游玩。';
+    var names = [], others = [], kernelFail = false;
+    for (var i = 0; i < fails.length; i++) {
+      names.push(fails[i].cn);
+      if (fails[i].id === 'kernel') kernelFail = true;
+      else others.push(fails[i].cn);
+    }
+    $('r-title').textContent = kernelFail ? '浏览器内核不兼容' : '检测未通过';
+    $('r-sub').textContent = kernelFail
+      ? '当前内核低于 WebView ' + MIN_WEBVIEW + ' / Chromium ' + MIN_WEBVIEW + ' 基线，游戏可能无法启动或直接黑屏' +
+        (others.length ? '；同时' + others.join('、') + '未通过' : '') +
+        '。请升级系统 WebView 或改用最新版 Chrome、Edge、Safari——你也可以坚持游玩。'
+      : '缺少运行游戏所需的关键能力：' + names.join('、') + '。画面可能黑屏、卡顿或无法操作——你可以退出，也可以坚持游玩。';
 
     var actions = $('r-actions');
     actions.hidden = false;
@@ -1147,9 +1637,42 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
 
     lines.push('雪迹 · 运行环境检测');
     lines.push('结果：' + verdict);
+    lines.push('兼容性：' + (fails.length ? '不兼容' : (warns.length ? '基本兼容（' + warns.length + ' 项提示）' : '完全兼容')));
+    lines.push('判定标准：WebView / Chromium ≥ ' + MIN_WEBVIEW + '（建议 ' + RECOMMEND + '+）· Firefox ≥ ' + MIN_GECKO +
+      ' · Safari / WebKit ≥ ' + MIN_WEBKIT + '（建议 ' + RECOMMEND_WEBKIT + '+）· WebGL2 必需');
+    lines.push('设备形态：' + (isDesktop() ? '桌面端（鼠标 / 键盘）' : '移动 / 手持（触屏 / 旋转）'));
     lines.push('时间：' + fmtTime(new Date()));
     lines.push('浏览器：' + info.engine + (info.ver ? ' ' + info.ver : '') +
       (info.container ? ' · ' + info.container + '内置' : '') + ' · ' + platformLabel());
+    if (env.kernel) {
+      var k = env.kernel;
+      lines.push('内核：' + k.engineName + (k.version ? ' ' + fmtVer(k.version) : '') +
+        (k.brand && k.brand !== k.engineName ? ' · ' + k.brand + (k.brandVersion ? ' ' + k.brandVersion : '') : '') +
+        (k.mismatch ? ' · UA 与指纹不一致' : ' · 指纹一致'));
+      lines.push('运行容器：' + (k.webview || (k.container ? k.container + '内置' : '系统浏览器')) +
+        (k.webview && k.container ? ' · ' + k.container + '内置' : '') + (k.desktop ? ' · 桌面' : ''));
+      lines.push('版本来源：' + (k.chVersion
+        ? 'UA-CH 实核 ' + k.chVersion + '（UA 声称 ' + (k.uaMajor || '—') + '）'
+        : 'UA 声称 ' + (k.uaMajor || '—') + ' / 内核指纹'));
+      if (k.baseline) {
+        var cssMiss = k.baseline.missingCss.length ? '（缺 ' + k.baseline.missingCss.join('、') + '）' : '';
+        var apiMiss = k.baseline.missingApi.length ? '（缺 ' + k.baseline.missingApi.join('、') + '）' : '';
+        var enhMiss = k.baseline.missingEnhanced.length ? '（缺 ' + k.baseline.missingEnhanced.join('、') + '，不阻断）' : '';
+        lines.push('语法基线：ES2020 ' + (k.baseline.es2020 ? '通过' : '失败') +
+          ' · async/await ' + (k.baseline.asyncOk ? '通过' : '失败'));
+        lines.push('启动接口：' + k.baseline.apiOk + '/' + k.baseline.apiTotal + apiMiss);
+        lines.push('阻断级 CSS：' + k.baseline.cssOk + '/' + k.baseline.cssTotal + cssMiss);
+        lines.push('增强级 CSS：' + k.baseline.enhancedOk + '/' + k.baseline.enhancedTotal + enhMiss);
+      }
+      if (k.chBrands && k.chBrands.length) {
+        var cbs = [];
+        for (var ci = 0; ci < k.chBrands.length; ci++) {
+          var cb = k.chBrands[ci] || {};
+          if (cb.brand && !/Not.*Brand/i.test(cb.brand)) cbs.push(cb.brand + ' ' + cb.version);
+        }
+        if (cbs.length) lines.push('UA-CH：' + cbs.join(' / '));
+      }
+    }
     lines.push('打开方式：' + (window.location.protocol === 'file:' ? '本地文件' : window.location.protocol.replace(':', '').toUpperCase()));
     lines.push('屏幕：' + Math.round(window.innerWidth) + ' × ' + Math.round(window.innerHeight) +
       ' @ DPR ' + (Math.round((window.devicePixelRatio || 1) * 100) / 100));
@@ -1257,19 +1780,52 @@ footer .sep{margin:0 .55em; color:rgba(244,247,251,.18)}
 
     env.ua = uaInfo();
 
-    // 让第一帧先画出来，再开始占用 GPU
-    requestAnimationFrame(function () {
+    function start() {
+      try { env.kernel = kernelInfo(); } catch (eKernel) { env.kernel = null; }
+
+      // 让第一帧先画出来，再开始占用 GPU
       requestAnimationFrame(function () {
-        try {
-          env.webgl = probeWebGL2();
-          if (env.webgl.ok) env.render = testGL(env.webgl.gl);
-          if (navigator.gpu) env.gpuPromise = probeWebGPU();
-        } catch (e) {
-          // 探测失败不阻塞流程，交由各项检查报告
-        }
-        setTimeout(nextStep, 140);
+        requestAnimationFrame(function () {
+          try {
+            env.webgl = probeWebGL2();
+            if (env.webgl.ok) env.render = testGL(env.webgl.gl);
+            if (navigator.gpu) env.gpuPromise = probeWebGPU();
+          } catch (e) {
+            // 探测失败不阻塞流程，交由各项检查报告
+          }
+          setTimeout(nextStep, 140);
+        });
       });
-    });
+    }
+
+    /* 先取 UA-CH 高精度内核版本（最多等 700ms），再识别内核版本 */
+    var uad = navigator.userAgentData;
+    if (uad && uad.getHighEntropyValues) {
+      var settled = false;
+      var wait = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        start();
+      }, 700);
+      try {
+        uad.getHighEntropyValues(['fullVersionList']).then(function (hi) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(wait);
+          env.chList = (hi && hi.fullVersionList) || [];
+          start();
+        }, function () {
+          if (settled) return;
+          settled = true;
+          clearTimeout(wait);
+          start();
+        });
+      } catch (eUA) {
+        if (!settled) { settled = true; clearTimeout(wait); start(); }
+      }
+    } else {
+      start();
+    }
   }
 
   document.addEventListener('keydown', function (e) {
